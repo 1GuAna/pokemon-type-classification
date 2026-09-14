@@ -1,0 +1,356 @@
+---
+title: "Predicting Pokemon primary type from battle statistics"
+author: "Aono Li"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE,
+                      fig.path = "figures/", dpi = 150)
+```
+
+```{r libraries}
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(corrplot)
+library(glmnet)
+library(ranger)
+tidymodels_prefer()
+
+set.seed(123)
+```
+
+## 1. Cleaning variable names
+
+```{r q1-clean}
+pokemon_raw <- read_csv("data/Pokemon.csv")
+
+names(pokemon_raw)
+
+pokemon <- clean_names(pokemon_raw)
+
+names(pokemon)
+```
+
+`clean_names()` rewrites every column name into a consistent snake_case form: it
+lowercases letters, replaces spaces and periods with underscores, and translates
+punctuation into words or drops it. Here `Sp. Atk` becomes `sp_atk`, `Type 1`
+becomes `type_1`, and the `#` column becomes `number`.
+
+This matters because the original names require backtick-quoting to reference in
+R and break `dplyr`, `recipes`, and formula syntax. Standardizing them once at
+the start makes every downstream reference predictable and typo-resistant.
+
+## 2. Outcome distribution and class lumping
+
+```{r q2-barchart}
+pokemon %>%
+  ggplot(aes(x = fct_infreq(type_1))) +
+  geom_bar() +
+  labs(x = "Primary type", y = "Count") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+pokemon %>% count(type_1, sort = TRUE)
+```
+
+There are 18 classes of the outcome, and they are strongly unbalanced. Water
+is the most common with 112 Pokémon, followed by Normal (98), Grass (70), Bug
+(69), Psychic (57), and Fire (52). At the other end, Flying has only 4
+Pokémon, Fairy 17, and Ice 24 — far too few to estimate a class-specific decision
+boundary from, especially once the data are split into training, testing, and
+five folds.
+
+```{r q2-lump}
+pokemon <- pokemon %>%
+  mutate(type_1     = fct_lump_n(factor(type_1), n = 6),
+         legendary  = factor(legendary),
+         generation = factor(generation))
+
+levels(pokemon$type_1)
+count(pokemon, type_1, sort = TRUE)
+```
+
+`fct_lump_n(n = 6)` keeps the six most frequent levels and collapses the
+remaining twelve into `Other`, leaving seven classes. Note that the pooled
+`Other` category is now the largest class in the data, which is worth keeping in
+mind when interpreting the model's predictions later.
+
+## 3. Splitting and cross-validation
+
+```{r q3-split}
+pokemon_split <- initial_split(pokemon, prop = 0.80, strata = type_1)
+pokemon_train <- training(pokemon_split)
+pokemon_test  <- testing(pokemon_split)
+
+dim(pokemon_train); dim(pokemon_test)
+
+pokemon_folds <- vfold_cv(pokemon_train, v = 5, strata = type_1)
+pokemon_folds
+```
+
+Stratifying the folds keeps the class proportions of `type_1` roughly constant
+across all five assessment sets. Without it, the rarer types could be badly
+under-represented — or absent entirely — in some folds purely by chance, which
+makes the fold-level ROC AUC unstable and inflates its standard error. Since the
+classes remain unbalanced even after lumping, stratification is what allows each
+fold to serve as a fair miniature of the training set.
+
+## 4. Correlation among the battle statistics
+
+```{r q4-corrplot}
+pokemon_train %>%
+  select(total, hp, attack, defense, sp_atk, sp_def, speed) %>%
+  cor() %>%
+  corrplot(method = "number", type = "lower", diag = FALSE)
+```
+
+The categorical variables are excluded here. `type_1` and `legendary` are
+unordered, so a Pearson correlation computed on their numeric codes would carry
+no meaning; `generation` is ordered but its spacing is arbitrary, and correlating
+it would only measure a linear trend across game releases with no natural
+interpretation. The battle statistics are continuous and comparable, so the
+matrix is restricted to those.
+
+Every statistic correlates positively with `total`, from 0.57 to 0.74, but this
+is definitional rather than empirical: `total` is the sum of the six components,
+so it must move with each. That is also why it is excluded from the recipe in Q5.
+
+Among the components themselves the correlations are modest and uniformly
+positive, from about 0.17 to 0.51. The strongest pairs are `defense`–`sp_def`
+(0.51) and `sp_atk`–`sp_def` (0.49), suggesting a general defensive axis.
+`speed` is essentially uncorrelated with `defense` and only weakly related to
+`hp` (0.17) — the familiar contrast between fast fragile and slow bulky Pokémon,
+appearing as an absence of correlation rather than a negative one. No pair is
+negatively correlated, so stronger Pokémon tend to be stronger across the board
+rather than trading one stat against another.
+
+## 5. Recipe
+
+```{r q5-recipe}
+pokemon_recipe <- recipe(type_1 ~ legendary + generation + sp_atk + attack +
+                           speed + defense + hp + sp_def,
+                         data = pokemon_train) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors())
+
+pokemon_recipe
+```
+
+## 6. Elastic net specification
+
+```{r q6-elastic-net}
+en_model <- multinom_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+en_wf <- workflow() %>%
+  add_model(en_model) %>%
+  add_recipe(pokemon_recipe)
+
+en_grid <- grid_regular(
+  penalty(range = c(0.01, 3), trans = scales::identity_trans()),
+  mixture(range = c(0, 1)),
+  levels = 10
+)
+
+nrow(en_grid)
+head(en_grid)
+```
+
+`penalty()` defaults to a base-10 log scale, so `trans = identity_trans()` is
+required for the range 0.01–3 to be read as raw penalty values rather than as
+exponents.
+
+## 7. Random forest specification
+
+```{r q7-random-forest}
+rf_model <- rand_forest(mtry = tune(), trees = tune(), min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity") %>%
+  set_mode("classification")
+
+rf_wf <- workflow() %>%
+  add_model(rf_model) %>%
+  add_recipe(pokemon_recipe)
+
+rf_grid <- grid_regular(
+  mtry(range = c(1, 8)),
+  trees(range = c(200, 800)),
+  min_n(range = c(2, 20)),
+  levels = 8
+)
+
+nrow(rf_grid)
+```
+
+`mtry` is the number of predictors randomly sampled as candidates at each split.
+Restricting the candidate set is what decorrelates the trees: if every split
+could consider every predictor, the strongest one would head almost every tree
+and the ensemble would gain little from averaging.
+
+`trees` is the number of trees grown in the forest. Predictions are aggregated by
+majority vote across them, so more trees reduce variance, with the error curve
+flattening once enough have been grown.
+
+`min_n` is the minimum number of observations a node must contain to be split
+further. Larger values stop growth earlier and produce shallower, more heavily
+regularized trees; smaller values let trees grow until nodes are nearly pure.
+
+`mtry` cannot be smaller than 1 because every split must consider at least one
+candidate predictor — with zero candidates there is nothing to split on. It
+cannot exceed 8 because the recipe supplies only eight predictors, and sampling
+more columns than exist is undefined.
+
+`mtry = 8` makes every predictor a candidate at every split, so no decorrelation
+occurs. That is bagging — bootstrap-aggregated trees — rather than a random
+forest.
+
+## 8. Tuning
+
+The random forest grid contains `r nrow(rf_grid)` combinations across 5 folds,
+which takes far too long to run at knit time. It is tuned in the separate script
+`tune_rf.R` and the results are read back in here.
+
+```{r q8-tune-en}
+en_tune <- tune_grid(
+  en_wf,
+  resamples = pokemon_folds,
+  grid = en_grid,
+  metrics = metric_set(roc_auc)
+)
+
+write_rds(en_tune, "cache/en_tune.rds")
+```
+
+```{r q8-load-rf}
+rf_tune <- read_rds("cache/rf_tune.rds")
+```
+
+```{r q8-autoplot}
+autoplot(en_tune)
+autoplot(rf_tune)
+```
+
+**Elastic net.** Smaller penalties are uniformly better. AUC peaks at the
+smallest grid value (0.01) and falls monotonically; past a penalty of about 1,
+every model with a substantial lasso component has collapsed to 0.5, since pure
+$L_1$ shrinkage zeroes all coefficients and the model predicts the base rate.
+`mixture` matters only through how quickly that collapse arrives — ridge
+(`mixture` = 0) degrades most gently and still reaches 0.62 at penalty = 3, while
+mixtures above roughly 0.3 are indistinguishable and die quickly. The optimum
+sits at the boundary of the prescribed range, so it has not been bracketed.
+
+**Random forest.** `mtry` is the only hyperparameter that matters much. `mtry` =
+1 is clearly worst at about 0.685; performance jumps to roughly 0.715 at `mtry` =
+2–4, then drifts down toward 8. This is decorrelation at work: sampling few
+predictors per split makes trees more independent, whereas `mtry` = 8 is bagging
+and lets the same strong stats head every tree. `trees` and `min_n` have almost
+no effect — all eight tree counts overlap within noise in every panel, and the
+panels from `min_n` = 2 to 20 are nearly identical.
+
+```{r q8-best}
+collect_metrics(en_tune) %>% filter(.metric == "roc_auc") %>%
+  arrange(desc(mean)) %>% head(5)
+
+collect_metrics(rf_tune) %>% filter(.metric == "roc_auc") %>%
+  arrange(desc(mean)) %>% head(5)
+
+best_en <- select_best(en_tune, metric = "roc_auc")
+best_rf <- select_best(rf_tune, metric = "roc_auc")
+
+best_en
+best_rf
+```
+
+The best elastic net is `penalty` = 0.01 with `mixture` = 0.444, at a
+cross-validated ROC AUC of 0.6866 (SE 0.0130). The best random forest is
+`mtry` = 2, `trees` = 285, `min_n` = 2, at 0.7204 (SE 0.0130). The forest
+leads by 0.034 — about 2.6 standard errors — so the nonlinear model is genuinely
+better here rather than nominally ahead.
+
+## 9. Final fit and test-set evaluation
+
+```{r q9-final-fit}
+final_rf_wf  <- finalize_workflow(rf_wf, best_rf)
+final_rf_fit <- fit(final_rf_wf, data = pokemon_train)
+```
+
+```{r q9-vip}
+final_rf_fit %>%
+  extract_fit_parsnip() %>%
+  pluck("fit", "variable.importance") %>%
+  enframe(name = "variable", value = "importance") %>%
+  ggplot(aes(x = importance, y = fct_reorder(variable, importance))) +
+  geom_col() +
+  labs(x = "Importance (impurity)", y = NULL,
+       title = "Random forest variable importance")
+```
+
+The six battle statistics dominate and are nearly interchangeable: `sp_atk` is
+highest at about 52, with `speed`, `attack`, `defense`, `hp`, and `sp_def` in a
+tight band from roughly 45 to 50. The `generation` dummies contribute about 10
+apiece, and `legendary_TRUE` is least useful at about 5.
+
+This is broadly expected. Primary type is a design property that the stat
+distribution reflects, so the continuous stats carry the signal. Generation is
+arbitrary with respect to type — every game introduces Pokémon of every type —
+and legendary status is rare and spread across types, so neither should help.
+Mildly surprising is how evenly the six stats rank; part of that is an artifact
+of impurity importance, which favors continuous predictors with many possible
+split points over binary dummies.
+
+```{r q9-test-preds}
+rf_preds <- augment(final_rf_fit, new_data = pokemon_test)
+
+rf_preds %>%
+  roc_auc(truth = type_1,
+          .pred_Bug, .pred_Fire, .pred_Grass, .pred_Normal,
+          .pred_Psychic, .pred_Water, .pred_Other)
+```
+
+```{r q9-roc-curves}
+rf_preds %>%
+  roc_curve(truth = type_1,
+            .pred_Bug, .pred_Fire, .pred_Grass, .pred_Normal,
+            .pred_Psychic, .pred_Water, .pred_Other) %>%
+  autoplot()
+```
+
+```{r q9-confusion}
+rf_preds %>%
+  conf_mat(truth = type_1, estimate = .pred_class) %>%
+  autoplot(type = "heatmap")
+```
+
+```{r q9-accuracy}
+rf_preds %>% accuracy(truth = type_1, estimate = .pred_class)
+```
+
+## 10. What the model does and does not do
+
+Overall the model is mediocre: multiclass ROC AUC of 0.6816 on the testing
+set and accuracy of 0.410. The testing AUC falls 0.039 below the
+cross-validated 0.7204 — roughly three fold-level standard errors, a real drop
+rather than resampling noise. Two things contribute: the testing set holds only
+161 observations, so a single estimate is volatile; and `select_best()` takes the
+maximum over 512 configurations, which is optimistically biased, so part of the
+winning fold-average was luck.
+
+The confusion matrix and the ROC curves tell different stories. On hard
+predictions the model is good at `Other` (62 of 70 correct) and close to useless
+elsewhere — Fire, Grass, and Water receive no correct predictions at all, and
+Bug, Normal, and Psychic get one or two each. That reflects imbalance more than
+modeling: `Other` pools twelve types into 342 of 800 Pokémon, so the argmax rule
+sends nearly everything there.
+
+The per-class ROC curves assess ranking rather than the argmax decision, and are
+more informative. Bug is clearly best separated, with Fire and Normal also well
+above the diagonal; Psychic is moderate; Grass sits close to the diagonal and
+Water is essentially on it. So the model can rank Pokémon by their probability of
+being Bug even though it almost never predicts Bug outright — Bug Pokémon cluster
+at low, distinctive stat totals. Water is hardest: it is the largest real type
+and its members span nearly the whole stat range, from Magikarp to legendaries,
+leaving no signature to learn. Grass is similar. The broader lesson is that
+primary type is only weakly determined by battle statistics, and the model
+succeeds only where a type occupies a distinctive corner of stat space.
